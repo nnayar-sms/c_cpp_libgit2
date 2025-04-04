@@ -1,0 +1,271 @@
+name: C/C++ Build (Ubuntu)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Ubuntu Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install basic build tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake ninja-build pkg-config
+
+    - name: Auto-detect and install dependencies
+      run: |
+        # If a dependencies.txt file exists, use it to install dependencies
+        if [ -f "dependencies.txt" ]; then
+          sudo apt-get install -y $(cat dependencies.txt)
+        fi
+        
+        # If there's a CMake file, extract and install dependencies
+        if [ -f "CMakeLists.txt" ]; then
+          # Extract package dependencies from CMake files
+          CMAKE_DEPS=$(grep -E "find_package|pkg_check_modules" CMakeLists.txt | grep -oE '[A-Za-z0-9_-]+' | sort | uniq)
+          if [ ! -z "$CMAKE_DEPS" ]; then
+            echo "Detected CMake dependencies: $CMAKE_DEPS"
+            # Try to install common mappings from CMake module names to apt package names
+            for DEP in $CMAKE_DEPS; do
+              case $DEP in
+                Boost)
+                  sudo apt-get install -y libboost-all-dev
+                  ;;
+                ZLIB)
+                  sudo apt-get install -y zlib1g-dev
+                  ;;
+                OpenSSL)
+                  sudo apt-get install -y libssl-dev
+                  ;;
+                Threads)
+                  # Usually built-in
+                  ;;
+                Qt5|Qt6)
+                  sudo apt-get install -y qtbase5-dev
+                  ;;
+                CURL)
+                  sudo apt-get install -y libcurl4-openssl-dev
+                  ;;
+                *)
+                  # Try to guess package name (lowercase with lib prefix and -dev suffix)
+                  GUESS_PKG="lib$(echo $DEP | tr '[:upper:]' '[:lower:]')-dev"
+                  echo "Trying to install: $GUESS_PKG"
+                  sudo apt-get install -y $GUESS_PKG || true
+                  ;;
+              esac
+            done
+          fi
+        fi
+        
+        # If configure script exists, check for dependencies
+        if [ -f "configure" ]; then
+          # Run configure with --help to extract dependencies
+          CONFIGURE_DEPS=$(./configure --help | grep -E 'with-[a-z0-9_-]+' | grep -oE 'with-[a-z0-9_-]+' | sed 's/with-//g')
+          if [ ! -z "$CONFIGURE_DEPS" ]; then
+            echo "Detected configure dependencies: $CONFIGURE_DEPS"
+            # Try to install based on common naming patterns
+            for DEP in $CONFIGURE_DEPS; do
+              GUESS_PKG="lib$(echo $DEP | tr '[:upper:]' '[:lower:]')-dev"
+              echo "Trying to install: $GUESS_PKG"
+              sudo apt-get install -y $GUESS_PKG || true
+            done
+          fi
+        fi
+        
+        # If vcpkg.json exists, extract dependencies
+        if [ -f "vcpkg.json" ]; then
+          VCPKG_DEPS=$(grep -Eo '"dependencies"[^]]*]' vcpkg.json | grep -Eo '"[^"]*"' | sed 's/"//g' | grep -v dependencies)
+          if [ ! -z "$VCPKG_DEPS" ]; then
+            echo "Detected vcpkg dependencies: $VCPKG_DEPS"
+            # Try to map vcpkg package names to apt packages
+            for DEP in $VCPKG_DEPS; do
+              GUESS_PKG="lib$(echo $DEP | tr '[:upper:]' '[:lower:]')-dev"
+              echo "Trying to install: $GUESS_PKG"
+              sudo apt-get install -y $GUESS_PKG || true
+            done
+          fi
+        fi
+        
+        # If conanfile.txt or conanfile.py exists, use Conan to handle dependencies
+        if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
+          echo "Conan package manager detected, installing Conan..."
+          pip install conan
+          # Conan will handle the dependencies during the build step
+        fi
+
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        
+        # If using Conan, install dependencies first
+        if [ -f "../conanfile.txt" ] || [ -f "../conanfile.py" ]; then
+          conan install .. --build=missing
+        fi
+        
+        cmake .. -DCMAKE_BUILD_TYPE=Release -G Ninja
+
+    - name: Build
+      run: |
+        cd build
+        cmake --build . --config Release
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest -C Release --output-on-failure
+
+    - name: Collect all dependencies
+      run: |
+        echo "# Dependency Report" > dependency_report.md
+        echo "Generated on $(date)" >> dependency_report.md
+        echo "" >> dependency_report.md
+        
+        # Create directory to store detailed dependency information
+        mkdir -p dependency_info
+        
+        echo "## System Dependencies" >> dependency_report.md
+        echo "Listing installed apt packages:" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        dpkg-query -W -f='${binary:Package} ${Version}\n' | sort >> dependency_report.md
+        echo '```' >> dependency_report.md
+        
+        echo "" >> dependency_report.md
+        echo "## CMake Dependencies" >> dependency_report.md
+        if [ -f "CMakeLists.txt" ]; then
+          echo "### Direct CMake Dependencies" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          # Extract and document all find_package and pkg_check_modules calls more thoroughly
+          {
+            grep -rn --include="CMakeLists.txt" --include="*.cmake" "find_package" . | sed 's/://g' || echo "No find_package found"
+            grep -rn --include="CMakeLists.txt" --include="*.cmake" "pkg_check_modules" . | sed 's/://g' || echo "No pkg_check_modules found"
+          } >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # Try to get actual versions from CMake cache if build has run
+          if [ -f "build/CMakeCache.txt" ]; then
+            echo "" >> dependency_report.md
+            echo "### CMake Cache - Dependency Versions" >> dependency_report.md
+            echo '```' >> dependency_report.md
+            grep -E "_VERSION|_FOUND" build/CMakeCache.txt | sort >> dependency_report.md
+            echo '```' >> dependency_report.md
+            
+            # Save detailed cmake info
+            cp build/CMakeCache.txt dependency_info/
+            [ -f build/compile_commands.json ] && cp build/compile_commands.json dependency_info/
+          fi
+        fi
+        
+        # Conan dependencies
+        if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
+          echo "" >> dependency_report.md
+          echo "## Conan Dependencies" >> dependency_report.md
+          
+          echo "### Conan Direct Dependencies" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          if [ -f "conanfile.txt" ]; then
+            cat conanfile.txt >> dependency_report.md
+          else
+            cat conanfile.py >> dependency_report.md
+          fi
+          echo '```' >> dependency_report.md
+          
+          echo "" >> dependency_report.md
+          echo "### Conan Dependency Graph" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          cd build && conan info .. >> dependency_report.md || echo "Could not generate Conan info" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # Get Conan lock file if available
+          [ -f "build/conanbuildinfo.txt" ] && cp build/conanbuildinfo.txt dependency_info/
+          [ -f "build/conaninfo.txt" ] && cp build/conaninfo.txt dependency_info/
+        fi
+        
+        # vcpkg dependencies
+        if [ -f "vcpkg.json" ]; then
+          echo "" >> dependency_report.md
+          echo "## vcpkg Dependencies" >> dependency_report.md
+          echo "### vcpkg Direct Dependencies" >> dependency_report.md
+          echo '```json' >> dependency_report.md
+          cat vcpkg.json >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # If using vcpkg with CMake, try to extract more info
+          if [ -d "build/vcpkg_installed" ]; then
+            echo "" >> dependency_report.md
+            echo "### Installed vcpkg Packages" >> dependency_report.md
+            echo '```' >> dependency_report.md
+            find build/vcpkg_installed -name "CONTROL" -o -name "vcpkg_abi_info.txt" | xargs cat 2>/dev/null >> dependency_report.md || echo "No detailed vcpkg info found" >> dependency_report.md
+            echo '```' >> dependency_report.md
+          fi
+        fi
+        
+        # Look for package.json (Node.js dependencies)
+        if [ -f "package.json" ]; then
+          echo "" >> dependency_report.md
+          echo "## Node.js Dependencies" >> dependency_report.md
+          echo '```json' >> dependency_report.md
+          cat package.json >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          if [ -f "package-lock.json" ]; then
+            cp package-lock.json dependency_info/
+          fi
+        fi
+        
+        # Look for requirements.txt (Python dependencies)
+        if [ -f "requirements.txt" ]; then
+          echo "" >> dependency_report.md
+          echo "## Python Dependencies" >> dependency_report.md
+          echo "### Direct Dependencies (requirements.txt)" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          cat requirements.txt >> dependency_report.md
+          echo '```' >> dependency_report.md
+          
+          # Try to generate pip freeze output if Python is used
+          echo "" >> dependency_report.md
+          echo "### Complete Python Environment" >> dependency_report.md
+          echo '```' >> dependency_report.md
+          pip freeze >> dependency_report.md 2>/dev/null || echo "Could not generate pip freeze output" >> dependency_report.md
+          echo '```' >> dependency_report.md
+        fi
+        
+        # Look for typical C/C++ dependency patterns in source code
+        echo "" >> dependency_report.md
+        echo "## Source Code Analysis" >> dependency_report.md
+        echo "### Include Statements" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        find . -type f -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" | xargs grep -l "#include" | head -n 50 | xargs grep "#include" | sort | uniq -c | sort -nr >> dependency_report.md 2>/dev/null || echo "No C/C++ includes found" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        
+        # Look at shared library dependencies in compiled binaries
+        echo "" >> dependency_report.md
+        echo "## Binary Analysis" >> dependency_report.md
+        echo "### Shared Library Dependencies" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        find build -type f -executable -not -path "*/CMakeFiles/*" | head -n 20 | xargs -I{} bash -c "echo 'File: {}'; ldd {} 2>/dev/null || echo 'Not a dynamic executable'" >> dependency_report.md 2>/dev/null || echo "No binaries found or ldd not available" >> dependency_report.md
+        echo '```' >> dependency_report.md
+        
+        # Create a compressed archive of all dependency information
+        tar -czf dependency_info.tar.gz dependency_info dependency_report.md
+        
+        echo "Dependency report generated at dependency_report.md"
+        
+    - name: Upload dependency report
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-report
+        path: |
+          dependency_report.md
+          dependency_info.tar.gz
